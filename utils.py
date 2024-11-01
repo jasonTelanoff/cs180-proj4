@@ -1,11 +1,13 @@
+import numpy as np
 import matplotlib.pyplot as plt
+from skimage.feature import corner_harris, peak_local_max
+from scipy.ndimage import gaussian_filter
+import cv2
+from tqdm import tqdm
+from scipy.ndimage import distance_transform_edt
 import os
 import json
-import numpy as np
-import cv2
-from scipy.interpolate import griddata
 from matplotlib.widgets import Button
-from scipy.ndimage import distance_transform_edt
 
 
 def load_points(img1, img2, points_file):
@@ -82,6 +84,140 @@ def recale(img, points, factor):
     return img, points
 
 
+def get_harris_corners(im, edge_discard=20):
+    """
+    This function takes a b&w image and an optional amount to discard
+    on the edge (default is 5 pixels), and finds all harris corners
+    in the image. Harris corners near the edge are discarded and the
+    coordinates of the remaining corners are returned. A 2d array (h)
+    containing the h value of every pixel is also returned.
+
+    h is the same shape as the original image, im.
+    coords is 2 x n (ys, xs).
+    """
+
+    assert edge_discard >= 20
+
+    # find harris corners
+    h = corner_harris(im, method="eps", sigma=1)
+    coords = peak_local_max(h, min_distance=1, threshold_abs=10)
+
+    # discard points on edge
+    edge = edge_discard  # pixels
+    mask = (
+        (coords[:, 0] > edge)
+        & (coords[:, 0] < im.shape[0] - edge)
+        & (coords[:, 1] > edge)
+        & (coords[:, 1] < im.shape[1] - edge)
+    )
+    coords = coords[mask]
+    return h, coords
+
+
+def dist2(x, c):
+    """
+    dist2  Calculates squared distance between two sets of points.
+
+    Description
+    D = DIST2(X, C) takes two matrices of vectors and calculates the
+    squared Euclidean distance between them.  Both matrices must be of
+    the same column dimension.  If X has M rows and N columns, and C has
+    L rows and N columns, then the result has M rows and L columns.  The
+    I, Jth entry is the  squared distance from the Ith row of X to the
+    Jth row of C.
+
+    Adapted from code by Christopher M Bishop and Ian T Nabney.
+    """
+
+    ndata, dimx = x.shape
+    ncenters, dimc = c.shape
+    assert dimx == dimc, "Data dimension does not match dimension of centers"
+
+    return (
+        (np.ones((ncenters, 1)) * np.sum((x**2).T, axis=0)).T
+        + np.ones((ndata, 1)) * np.sum((c**2).T, axis=0)
+        - 2 * np.inner(x, c)
+    )
+
+
+def anms(h, coords, max_points=500):
+    n = len(coords)
+    c_robust = 0.9
+
+    # sort coords by h value first
+    coords = coords[np.argsort(h[coords[:, 0], coords[:, 1]])]
+
+    D = dist2(coords, coords)
+
+    h_values = np.array([h[int(coord[0]), int(coord[1])] for coord in coords])
+
+    r = np.full(n, np.inf)
+
+    for i in tqdm(range(n), desc="ANMS"):
+        valid_mask = h_values[i] < c_robust * h_values
+        valid_mask[i] = False
+
+        if np.any(valid_mask):
+            r[i] = np.min(D[i, valid_mask])
+
+    max_points = min(max_points, n)
+    selected_indices = np.argsort(r)[-max_points:]
+
+    return coords[selected_indices]
+
+
+def get_gaussian_stack(image, N, sigma):
+    stack = [image]
+    for _ in range(N):
+        stack.append(gaussian_filter(stack[-1], sigma))
+    return stack
+
+
+def get_features(coords, stack):
+    features = []
+
+    for i in range(len(coords)):
+        y, x = coords[i]
+        feature = np.zeros((8, 8))
+
+        for j in range(8):
+            for k in range(8):
+                _j = 5 * (j - 4) // 4
+                _k = 5 * (k - 4) // 4
+
+                feature[j, k] = stack[2][y + _j, x + _k]
+
+        feature = feature.flatten()
+        feature = (feature - np.mean(feature)) / np.std(feature)
+        features.append(feature)
+
+    return np.array(features)
+
+
+def compare_features(features1, features2):
+    D = dist2(features1, features2)
+    N1, _ = D.shape
+
+    sorted_indices = np.argsort(D, axis=1)
+    nearest_indices = sorted_indices[:, 0]
+    second_nearest_indices = sorted_indices[:, 1]
+
+    nearest_distances = D[np.arange(N1), nearest_indices]
+    second_nearest_distances = D[np.arange(N1), second_nearest_indices]
+
+    ratios = nearest_distances / second_nearest_distances
+
+    ratio_threshold = 0.8
+    mask = ratios < ratio_threshold
+
+    comparison_map = np.zeros_like(D, dtype=bool)
+    comparison_map[np.arange(N1), nearest_indices] = mask
+
+    matched_indices = np.argwhere(comparison_map)
+
+    return comparison_map, matched_indices
+
+
 def computeH(im1_pts, im2_pts):
     big_matrix = []
     little_matrix = []
@@ -110,22 +246,64 @@ def computeH(im1_pts, im2_pts):
     return homography_matrix
 
 
-def warpImage(im1, H, crop_to_original=False):
-    h1, w1, c1 = im1.shape
+def RANSAC(pairs, _map, coords1, coords2, n=1000, t=1):
+    best_count = 0
+    best_H = None
+    best_coords = None
+    best_distance = float("inf")
+
+    print(coords1.shape)
+
+    for _ in tqdm(range(n), desc="RANSAC"):
+        while True:
+            special_pairs = pairs[np.random.choice(pairs.shape[0], 4, replace=False)]
+            if len(np.unique(special_pairs.flatten())) == 8:
+                break
+
+        special_coords1 = coords1[special_pairs[:, 0]]
+        special_coords2 = coords2[special_pairs[:, 1]]
+
+        H = computeH(special_coords1, special_coords2)
+
+        transformed_coords1 = H @ np.vstack([coords1.T, np.ones(coords1.shape[0])])
+
+        transformed_coords1 /= transformed_coords1[2, :]
+        transformed_coords1 = transformed_coords1[:2].T
+
+        D = dist2(transformed_coords1, coords2)
+        mask = D < t
+
+        result = np.logical_and(mask, _map)
+        count = np.sum(result)
+
+        dist = np.sum(D[result])
+
+        if count > best_count or (count == best_count and dist < best_distance):
+            best_count = count
+            best_H = H
+            best_coords = transformed_coords1
+            best_distance = dist
+
+    return best_H, best_coords, best_count, best_distance
+
+
+def warpImage(im, H, crop_to_original=False):
+    h, w, _ = im.shape
 
     corners = np.array(
-        [[0, 0, 1], [w1 - 1, 0, 1], [w1 - 1, h1 - 1, 1], [0, h1 - 1, 1]],
+        [[0, 0, 1], [w - 1, 0, 1], [w - 1, h - 1, 1], [0, h - 1, 1]],
         dtype=np.float32,
     ).T
 
     warped_corners = H @ corners
     warped_corners /= warped_corners[2, :]
+
     min_x, min_y = np.min(warped_corners[:2, :], axis=1)
     max_x, max_y = np.max(warped_corners[:2, :], axis=1)
 
     if crop_to_original:
-        out_w = w1
-        out_h = h1
+        out_w = w
+        out_h = h
         min_x, min_y = 0, 0
     else:
         out_w = int(np.ceil(max_x - min(min_x, 0)))
@@ -133,7 +311,6 @@ def warpImage(im1, H, crop_to_original=False):
 
     print(f"Output image dimensions: width={out_w}, height={out_h}")
 
-    stitched_image = np.zeros((out_h, out_w, c1), dtype=np.float32)
     alpha_channel = np.zeros((out_h, out_w), dtype=np.float32)
 
     translate_x = -min_x if not crop_to_original else 0
@@ -146,46 +323,34 @@ def warpImage(im1, H, crop_to_original=False):
 
     cv2.fillConvexPoly(alpha_channel, translated_corners[:2, :].T.astype(np.int32), 1)
 
-    warped_points = []
-    pixel_values = []
-    print("Starting forward mapping of pixels...")
-    # TODO: Get rid of for loops
-    for y in range(h1):
-        for x in range(w1):
-            original_coords = np.array([x, y, 1]).T
+    H_inv = np.linalg.inv(H)
 
-            warped_coords = H @ original_coords
-            warped_coords /= warped_coords[2]
-            warped_x, warped_y = warped_coords[:2]
+    print("Starting inverse mapping of pixels...")
 
-            warped_x += translate_x
-            warped_y += translate_y
-
-            if 0 <= warped_x < out_w and 0 <= warped_y < out_h:
-                warped_points.append([warped_y, warped_x])
-                pixel_values.append(im1[y, x, :])
-
-    print(f"Number of points to interpolate: {len(warped_points)}")
-
-    # Interpolate the pixel values using griddata for smoother transformation
-    warped_points = np.array(warped_points)
-    pixel_values = np.array(pixel_values)
-    grid_y, grid_x = np.mgrid[0:out_h, 0:out_w]
-    print("Interpolating pixel values...")
-    for i in range(c1):
-        stitched_image[:, :, i] = griddata(
-            warped_points,
-            pixel_values[:, i],
-            (grid_y, grid_x),
-            method="linear",
-            fill_value=0,
-        )
-
-    return (
-        np.clip(stitched_image * 255, 0, 255).astype(np.uint8),
-        alpha_channel,
-        (-int(translate_x), -int(translate_y)),
+    x, y = np.meshgrid(np.arange(out_w), np.arange(out_h))
+    warped_coords = np.stack(
+        [x - translate_x, y - translate_y, np.ones_like(x)], axis=-1
     )
+
+    original_coords = (H_inv @ warped_coords.reshape(-1, 3).T).T
+    original_coords /= original_coords[:, [2]]
+
+    original_x = original_coords[:, 0].reshape(out_h, out_w).astype(np.float32)
+    original_y = original_coords[:, 1].reshape(out_h, out_w).astype(np.float32)
+
+    original_x = np.clip(original_x, 0, w - 1)
+    original_y = np.clip(original_y, 0, h - 1)
+
+    remapped = cv2.remap(
+        im,
+        original_x,
+        original_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+
+    return remapped.astype(int), alpha_channel, (-int(translate_x), -int(translate_y))
 
 
 def combine_images(warped_image, img2, alpha_channel, translate):
@@ -243,9 +408,7 @@ def combine_images(warped_image, img2, alpha_channel, translate):
     warped_image_large[
         im1_pos[1] : im1_pos[1] + warped_image.shape[0],
         im1_pos[0] : im1_pos[0] + warped_image.shape[1],
-    ] = (
-        warped_image / 255.0
-    )
+    ] = warped_image
 
     img2_large = np.zeros((combined_h, combined_w, 3), dtype=np.float32)
     img2_large[
@@ -264,3 +427,36 @@ def combine_images(warped_image, img2, alpha_channel, translate):
     )[overlap]
 
     return combined_image
+
+
+def visualize_feature_pairs(image1, image2, coords1, coords2, pairs):
+    combined_image = np.hstack((image1, image2))
+
+    offset = image1.shape[1]
+    coords2_offset = coords2 + [0, offset]
+
+    plt.figure(figsize=(10, 5))
+    plt.imshow(combined_image, cmap="gray")
+
+    plt.scatter(
+        coords1[:, 1], coords1[:, 0], color="blue", s=10, label="Image 1 Features"
+    )
+    plt.scatter(
+        coords2_offset[:, 1],
+        coords2_offset[:, 0],
+        color="blue",
+        s=10,
+        label="Image 2 Features",
+    )
+
+    for idx1, idx2 in pairs:
+        point1 = coords1[idx1]
+        point2 = coords2_offset[idx2]
+        plt.plot(
+            [point1[1], point2[1]], [point1[0], point2[0]], "yellow", linewidth=0.5
+        )
+
+    plt.legend()
+    plt.axis("off")
+    plt.title("Feature Matches Between Images")
+    plt.show()
